@@ -105,30 +105,126 @@ func someUsefulThings() {
 	_ = fmt.Sprintf("%s_%d", "file", 1)
 }
 
-// This is the type definition for the User struct.
-// A Go struct is like a Python or Java class - it can have attributes
-// (e.g. like the Username attribute) and methods (e.g. like the StoreFile method below).
-type User struct {
-	Username string
-
-	// You can add other attributes here if you want! But note that in order for attributes to
-	// be included when this struct is serialized to/from JSON, they must be capitalized.
-	// On the flipside, if you have an attribute that you want to be able to access from
-	// this struct's methods, but you DON'T want that value to be included in the serialized value
-	// of this struct that's stored in datastore, then you can use a "private" variable (e.g. one that
-	// begins with a lowercase letter).
+type Header struct {
+    Filename string
+    HeaderID userlib.UUID
+    HeaderKey []byte
+    IsOwned bool 
 }
 
-// NOTE: The following methods have toy (insecure!) implementations.
+type User struct {
+	Username string
+    rootKey []byte
+    AuthKey []byte
+    encryptionKey []byte
+    macKey []byte
+
+    publicKey userlib.PKEEncKey
+    PrivateKey userlib.PKEDecKey
+
+    Headers []Header
+}
 
 func InitUser(username string, password string) (userdataptr *User, err error) {
 	var userdata User
 	userdata.Username = username
+    userdata.rootKey = userlib.Argon2Key([]byte(password), []byte(username), 256)
+    userdata.AuthKey, err = userlib.HashKDF(userdata.rootKey, []byte("authentication"))
+    if err != nil {
+        return nil, err
+    }
+    userdata.encryptionKey, err = userlib.HashKDF(userdata.rootKey, []byte("encryption"))
+    if err != nil {
+        return nil, err
+    }
+    userdata.macKey, err = userlib.HashKDF(userdata.rootKey, []byte("hmac"))
+    if err != nil {
+        return nil, err
+    }
+
+    userdata.publicKey, userdata.PrivateKey, err = userlib.PKEKeyGen()
+    if err != nil {
+        return nil, err
+    }
+
+    storageId, err := uuid.FromBytes(userlib.Hash([]byte(username))[:16])
+    if err != nil {
+        return nil, err
+    }
+
+    plaintext, err := json.Marshal(userdata)
+    if err != nil {
+        return nil, err
+    }
+
+    iv := userlib.RandomBytes(16)
+    ciphertext := userlib.SymEnc(userdata.encryptionKey, iv, plaintext)
+    sum, err := userlib.HMACEval(userdata.macKey, ciphertext)
+    if err != nil {
+        return nil, err
+    }
+    ciphertext = append(ciphertext, sum...)
+
+    userlib.DatastoreSet(storageId, ciphertext)
+
 	return &userdata, nil
 }
 
 func GetUser(username string, password string) (userdataptr *User, err error) {
+    expectedRootKey := userlib.Argon2Key([]byte(password), []byte(username), 256)
+    expectedAuthKey, err := userlib.HashKDF(expectedRootKey, []byte("authentication"))
+    if err != nil {
+        return nil, err
+    }
+
+    storageId, err := uuid.FromBytes(userlib.Hash([]byte(username))[:16])
+    if err != nil {
+        return nil, err
+    }
+
+    ciphertext, exists := userlib.DatastoreGet(storageId)
+    if !exists {
+        // TODO: error
+        fmt.Println("unknown username")
+    }
+
+    encryptionKey, err := userlib.HashKDF(expectedRootKey, []byte("encryption"))
+    if err != nil {
+        return nil, err
+    }
+    macKey, err := userlib.HashKDF(expectedRootKey, []byte("hmac"))
+    if err != nil {
+        return nil, err
+    }
+
+    expectedSum := ciphertext[len(ciphertext) - 64:]
+    ciphertext = ciphertext[:len(ciphertext) - 64]
+    actualSum, err := userlib.HMACEval(macKey, ciphertext)
+    if err != nil {
+        return nil, err
+    }
+
+    if (!userlib.HMACEqual(expectedSum, actualSum)) {
+        // TODO: error
+        fmt.Printf("expected %s != actual %s\n", expectedSum, actualSum)
+    }
+
+    plaintext := userlib.SymDec(encryptionKey, ciphertext)
 	var userdata User
+    err = json.Unmarshal(plaintext, &userdata)
+    if err != nil {
+        return nil, err
+    }
+
+    if (!userlib.HMACEqual(expectedAuthKey, userdata.AuthKey)) {
+        // TODO: error
+        fmt.Printf("expected %s != actual %s\n", expectedAuthKey, userdata.AuthKey)
+    }
+
+    userdata.rootKey = expectedRootKey
+    userdata.encryptionKey = encryptionKey
+    userdata.macKey = macKey
+
 	userdataptr = &userdata
 	return userdataptr, nil
 }

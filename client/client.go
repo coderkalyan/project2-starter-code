@@ -126,6 +126,10 @@ type User struct {
 }
 
 func InitUser(username string, password string) (userdataptr *User, err error) {
+	// checks if username is empty
+	if len(username) == 0 { 
+		return nil, error.New("Please fill in the username")
+	}
 	var userdata User
 	userdata.Username = username
     userdata.rootKey = userlib.Argon2Key([]byte(password), []byte(username), 256)
@@ -150,6 +154,11 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
     storageId, err := uuid.FromBytes(userlib.Hash([]byte(username))[:16])
     if err != nil {
         return nil, err
+    }
+	// check if username already exists 
+	// ______, exists := userlib.DatastoreGet(storageId)
+    if exists {
+        return nil, errors.New("username already exists")
     }
 
     plaintext, err := json.Marshal(userdata)
@@ -181,11 +190,10 @@ func GetUser(username string, password string) (userdataptr *User, err error) {
     if err != nil {
         return nil, err
     }
-
+	// checking if username does not exist in the system 
     ciphertext, exists := userlib.DatastoreGet(storageId)
     if !exists {
-        // TODO: error
-        fmt.Println("unknown username")
+        return nil, errors.New("unknown username")
     }
 
     encryptionKey, err := userlib.HashKDF(expectedRootKey, []byte("encryption"))
@@ -203,10 +211,10 @@ func GetUser(username string, password string) (userdataptr *User, err error) {
     if err != nil {
         return nil, err
     }
-
+	// Malicious Activity detected in the file
     if (!userlib.HMACEqual(expectedSum, actualSum)) {
-        // TODO: error
-        fmt.Printf("expected %s != actual %s\n", expectedSum, actualSum)
+        return nil, error.New("Compromised File")
+        //fmt.Printf("expected %s != actual %s\n", expectedSum, actualSum)
     }
 
     plaintext := userlib.SymDec(encryptionKey, ciphertext)
@@ -215,10 +223,10 @@ func GetUser(username string, password string) (userdataptr *User, err error) {
     if err != nil {
         return nil, err
     }
-
+	// Incorrect Password
     if (!userlib.HMACEqual(expectedAuthKey, userdata.AuthKey)) {
-        // TODO: error
-        fmt.Printf("expected %s != actual %s\n", expectedAuthKey, userdata.AuthKey)
+        return nil, error.New("Incorrect Password")
+        //fmt.Printf("expected %s != actual %s\n", expectedAuthKey, userdata.AuthKey)
     }
 
     userdata.rootKey = expectedRootKey

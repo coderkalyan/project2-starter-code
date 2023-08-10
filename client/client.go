@@ -33,6 +33,8 @@ import (
 
 	// Optional.
 	_ "strconv"
+
+    "encoding/hex"
 )
 
 // This serves two purposes: it shows you a few useful primitives,
@@ -123,6 +125,23 @@ type User struct {
     PrivateKey userlib.PKEDecKey
 
     Headers []Header
+}
+
+type Chunk struct {
+    Content []byte
+    Prev userlib.UUID
+}
+
+type SharedUser struct {
+    Username string
+    HeaderKey []byte
+    FileHeader userlib.UUID
+}
+
+type FileHeader struct {
+    Last userlib.UUID
+    LastKey []byte
+    SharedWith []SharedUser
 }
 
 func InitUser(username string, password string) (userdataptr *User, err error) {
@@ -238,15 +257,69 @@ func GetUser(username string, password string) (userdataptr *User, err error) {
 }
 
 func (userdata *User) StoreFile(filename string, content []byte) (err error) {
-	storageKey, err := uuid.FromBytes(userlib.Hash([]byte(filename + userdata.Username))[:16])
+    chunkId := uuid.New()
+    prev, err := hex.DecodeString("0000000000000000")
+    if err != nil {
+        return err
+    }
+    prevId, err := uuid.FromBytes(prev)
+    if err != nil {
+        return err
+    }
+    chunk := Chunk {
+        Content: content,
+        Prev: prevId,
+    }
+
+    plaintext, err := json.Marshal(chunk)
 	if err != nil {
 		return err
 	}
-	contentBytes, err := json.Marshal(content)
-	if err != nil {
-		return err
-	}
-	userlib.DatastoreSet(storageKey, contentBytes)
+
+    chunkBaseKey := userlib.RandomBytes(16)
+    chunkEncKey, err := userlib.HashKDF(chunkBaseKey, []byte("encryption"))
+    if err != nil {
+        return err
+    }
+    chunkMacKey, err := userlib.HashKDF(chunkBaseKey, []byte("hmac"))
+    if err != nil {
+        return err
+    }
+
+    iv := userlib.RandomBytes(16)
+    ciphertext := userlib.SymEnc(chunkEncKey, iv, plaintext)
+    sum, err := userlib.HMACEval(chunkMacKey, ciphertext)
+    if err != nil {
+        return err
+    }
+    ciphertext = append(ciphertext, sum...)
+    userlib.DatastoreSet(chunkId, ciphertext)
+
+    headerId, err := uuid.FromBytes(userlib.Hash([]byte(filename + userdata.Username))[:16])
+    if err != nil {
+        return err
+    }
+
+    header := FileHeader {
+        Last: chunkId,
+        LastKey: chunkBaseKey,
+        SharedWith: []SharedUser{},
+    }
+    
+    plaintext, err = json.Marshal(header)
+    if err != nil {
+        return err
+    }
+
+    iv = userlib.RandomBytes(16)
+    ciphertext = userlib.SymEnc(userdata.encryptionKey, iv, plaintext)
+    sum, err = userlib.HMACEval(userdata.macKey, ciphertext)
+    if err != nil {
+        return err
+    }
+    ciphertext = append(ciphertext, sum...)
+    userlib.DatastoreSet(headerId, ciphertext)
+
 	return
 }
 
@@ -255,14 +328,58 @@ func (userdata *User) AppendToFile(filename string, content []byte) error {
 }
 
 func (userdata *User) LoadFile(filename string) (content []byte, err error) {
-	storageKey, err := uuid.FromBytes(userlib.Hash([]byte(filename + userdata.Username))[:16])
+    headerId, err := uuid.FromBytes(userlib.Hash([]byte(filename + userdata.Username))[:16])
 	if err != nil {
 		return nil, err
 	}
-	dataJSON, ok := userlib.DatastoreGet(storageKey)
-	if !ok {
-		return nil, errors.New(strings.ToTitle("file not found"))
-	}
+    ciphertext, ok := userlib.DatastoreGet(headerId)
+    if !ok {
+        return nil, errors.New(strings.ToTitle("unable to find or decrypt file"))
+    }
+
+    if (!userlib.HMACEqual(userdata.macKey, ciphertext[len(ciphertext) - 64:])) {
+        return nil, errors.New(strings.ToTitle("unable to find or decrypt file"))
+    }
+    ciphertext = ciphertext[:len(ciphertext) - 64]
+    plaintext := userlib.SymDec(userdata.encryptionKey, ciphertext)
+
+    var header FileHeader
+    err = json.Unmarshal(plaintext, &header)
+    if err != nil {
+        return nil, err
+    }
+
+    prev := header.Last
+    prevKey := header.LastKey
+    terminator, err := hex.DecodeString("0000000000000000")
+    if err != nil {
+        return nil, err
+    }
+    termId, err := uuid.FromBytes(terminator)
+    if err != nil {
+        return nil, err
+    }
+    for prev != termId {
+        ciphertext, ok := userlib.DatastoreGet(prev)
+        if !ok {
+            return nil, errors.New(strings.ToTitle("unable to find or decrypt file"))
+        }
+
+        chunkEncKey, err := userlib.HashKDF(prevKey, []byte("encryption"))
+        if err != nil {
+            return err
+        }
+        chunkMacKey, err := userlib.HashKDF(prevKey, []byte("hmac"))
+        if err != nil {
+            return err
+        }
+        if (!userlib.HMACEqual(chunkMacKey, ciphertext[len(ciphertext) - 64:])) {
+            return nil, errors.New(strings.ToTitle("unable to find or decrypt file"))
+        }
+        ciphertext = ciphertext[:len(ciphertext) - 64]
+        plaintext := userlib.SymDec(userdata.encryptionKey, ciphertext)
+    }
+
 	err = json.Unmarshal(dataJSON, &content)
 	return content, err
 }
